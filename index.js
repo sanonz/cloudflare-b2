@@ -29,6 +29,39 @@ const HTTPS_PORT = "443";
 // How many times to retry a range request where the response is missing content-range
 const RANGE_RETRY_ATTEMPTS = 3;
 
+// Encode an ArrayBuffer as a lowercase hex string
+function hexEncode(buffer) {
+    return Array.from(new Uint8Array(buffer))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
+}
+
+// Verify a time-limited HMAC-SHA256 token.
+// The signed message is "<pathname>:<exp>" so the token is tied to a specific
+// path and expiry timestamp, but is independent of other query parameters.
+// Returns true if the token is valid, false otherwise.
+async function verifyToken(secret, pathname, exp, token) {
+    const encoder = new TextEncoder();
+    const keyMaterial = await crypto.subtle.importKey(
+        'raw',
+        encoder.encode(secret),
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign']
+    );
+    const message = `${pathname}:${exp}`;
+    const signatureBuffer = await crypto.subtle.sign('HMAC', keyMaterial, encoder.encode(message));
+    const expected = hexEncode(signatureBuffer);
+
+    // Constant-time comparison to prevent timing-side-channel attacks
+    if (expected.length !== token.length) return false;
+    let diff = 0;
+    for (let i = 0; i < expected.length; i++) {
+        diff |= expected.charCodeAt(i) ^ token.charCodeAt(i);
+    }
+    return diff === 0;
+}
+
 // Filter out cf-* and any other headers we don't want to include in the signature
 function filterHeaders(headers, env) {
     // Suppress irrelevant IntelliJ warning
@@ -70,6 +103,40 @@ export default {
         }
 
         const url = new URL(request.url);
+
+        // Signature bypass whitelist: if the first path segment is in PATH_WHITELIST,
+        // skip token validation entirely and proxy the request directly.
+        // e.g. PATH_WHITELIST = "public,assets" will bypass signing for /public/... and /assets/...
+        const firstSegment = url.pathname.split('/').filter(Boolean)[0] || '';
+        const bypassList = env['PATH_WHITELIST']
+            ? env['PATH_WHITELIST'].split(',').map(s => s.trim()).filter(Boolean)
+            : [];
+        const bypassSignature = bypassList.includes(firstSegment);
+
+        // Validate time-limited HMAC token.
+        // Clients must pass ?token=<hmac-sha256-hex>&exp=<unix-seconds>
+        // where HMAC is computed over "<pathname>:<exp>" using TOKEN_SECRET.
+        if (!bypassSignature) {
+            if (!env['TOKEN_SECRET']) {
+                return new Response('TOKEN_SECRET is not configured', { status: 500 });
+            }
+            const tokenParam = url.searchParams.get('token');
+            const expParam = url.searchParams.get('exp');
+            if (!tokenParam || !expParam) {
+                return new Response('Missing token or exp parameter', { status: 403 });
+            }
+            const expSeconds = parseInt(expParam, 10);
+            if (isNaN(expSeconds) || expSeconds < Math.floor(Date.now() / 1000)) {
+                return new Response('Token expired', { status: 403 });
+            }
+            const tokenValid = await verifyToken(env['TOKEN_SECRET'], url.pathname, expParam, tokenParam);
+            if (!tokenValid) {
+                return new Response('Invalid token', { status: 403 });
+            }
+            // Strip token params before forwarding to B2
+            url.searchParams.delete('token');
+            url.searchParams.delete('exp');
+        }
 
         // Incoming protocol and port is taken from the worker's environment.
         // Local dev mode uses plain http on 8787, and it's possible to deploy
